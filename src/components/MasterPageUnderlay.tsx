@@ -21,7 +21,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { useEffect, useRef, useState } from 'react';
-import * as pdfjsLib from 'pdfjs-dist';
 import Konva from 'konva';
 import {
   Layer, Rect, Line, Text, Group, Path, Circle, Shape,
@@ -34,8 +33,7 @@ import { TableRenderer } from './TableRenderer';
 import { MarksShapeRenderer, isMarkType, isLineMark } from './MarksRenderer';
 import { getSpreads } from '../utils/spreadLayout';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  `//unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+import { acquirePdfDoc, releasePdfDoc } from '../utils/pdfDocumentManager';
 
 // ─── Master Background Canvas ─────────────────────────────────────────────────
 // Renders the master's background PDF page (if any) onto a <canvas> element
@@ -59,8 +57,9 @@ export function MasterBgCanvas({ master, scale, panOffset, offsetX = 0, offsetY 
 
     let cancelled = false;
     const canvas = canvasRef.current;
+    const bytes = master.backgroundPdfBytes;
 
-    pdfjsLib.getDocument({ data: new Uint8Array(master.backgroundPdfBytes.slice(0)) }).promise
+    acquirePdfDoc(bytes)
       .then(async (pdf) => {
         if (cancelled) return;
         const pageIdx = Math.max(1, Math.min(master.backgroundPageNum, pdf.numPages));
@@ -85,11 +84,15 @@ export function MasterBgCanvas({ master, scale, panOffset, offsetX = 0, offsetY 
           ctx.translate(-viewport.width / 2, 0);
         }
         await page.render({ canvasContext: ctx, viewport } as any).promise;
+        page.cleanup();
         if (!cancelled) setNonce(n => n + 1);
       })
       .catch(() => { /* silently ignore if bytes are invalid */ });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      releasePdfDoc(bytes);
+    };
   }, [master.backgroundPdfBytes, master.backgroundPageNum, scale, side]);
 
   if (!master.backgroundPdfBytes) return null;
@@ -910,11 +913,11 @@ interface MasterUnderlayLayerProps {
 export function MasterUnderlayLayer({
   tabId, pageNum, scale, totalPages, documentPageWidth = 612, documentPageHeight = 792,
 }: MasterUnderlayLayerProps) {
-  const { documents, masterPages: globalMasterPages, tabMetas } = useStore();
-  const doc = documents[tabId];
+  const doc = useStore((s) => s.documents[tabId]);
+  const globalMasterPages = useStore((s) => s.masterPages);
   const masterPages = doc?.masterPages || globalMasterPages || [];
   const assignments = doc?.masterPageAssignments || {};
-  const docTitle = tabMetas[tabId]?.label || 'Untitled';
+  const docTitle = useStore((s) => s.tabMetas[tabId]?.label || 'Untitled');
 
   const isSpread = doc?.isSpread || false;
   const hasCoverPage = doc?.hasFrontCover || false;

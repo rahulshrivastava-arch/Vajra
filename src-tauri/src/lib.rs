@@ -1,8 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::{Emitter, State};
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutEvent, ShortcutState};
+use tauri::State;
 
 #[derive(Default)]
 pub struct ScreenshotCache(pub Mutex<HashMap<String, String>>);
@@ -78,34 +77,63 @@ fn debug_log(msg: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let ctrl_shift_s = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+
 
     tauri::Builder::default()
         .manage(ScreenshotCache::default())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcuts([ctrl_shift_s])
-                .unwrap()
-                .with_handler(
-                    move |app: &tauri::AppHandle, shortcut: &Shortcut, event: ShortcutEvent| {
-                        if shortcut == &ctrl_shift_s && event.state() == ShortcutState::Pressed {
-                            let _ = app.emit("open-snipping-tool", ());
-                        }
-                    },
-                )
-                .build(),
-        )
+
         .setup(|app| {
+            use tauri::Manager;
+            println!("[RUST SETUP] Starting Tauri setup...");
+            let windows = app.webview_windows();
+            println!("[RUST SETUP] Webview windows count: {}", windows.len());
+            for (label, win) in &windows {
+                println!("[RUST SETUP] Found window label: {}, is_visible: {:?}", label, win.is_visible());
+                println!("[RUST SETUP] is_minimized: {:?}, is_maximized: {:?}, is_focused: {:?}", 
+                    win.is_minimized(), win.is_maximized(), win.is_focused());
+                println!("[RUST SETUP] outer_position: {:?}, inner_size: {:?}", 
+                    win.outer_position(), win.inner_size());
+                println!("[RUST SETUP] current_monitor: {:?}", win.current_monitor());
+                #[cfg(target_os = "windows")]
+                if let Ok(hwnd) = win.hwnd() {
+                    println!("[RUST SETUP] Window HWND: {:?}, int: {}", hwnd, hwnd.0 as usize);
+                }
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+            if windows.is_empty() {
+                println!("[RUST SETUP] No windows configured or created! Attempting to create 'main' window manually...");
+                let win_builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                    .title("Vajra")
+                    .inner_size(800.0, 600.0)
+                    .visible(true)
+                    .center();
+                match win_builder.build() {
+                    Ok(w) => {
+                        println!("[RUST SETUP] Successfully manually created main window!");
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                    Err(e) => {
+                        eprintln!("[RUST SETUP] Failed to create main window: {}", e);
+                    }
+                }
+            }
             if cfg!(debug_assertions) {
-                app.handle().plugin(
+                let _ = app.handle().plugin(
                     tauri_plugin_log::Builder::default()
                         .level(log::LevelFilter::Info)
                         .build(),
-                )?;
+                );
             }
+            println!("[RUST SETUP] Setup completed successfully!");
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            println!("[WINDOW EVENT] {}: {:?}", window.label(), event);
         })
         .invoke_handler(tauri::generate_handler![get_monitors, capture_all_monitors, get_monitor_capture, debug_log])
         .run(tauri::generate_context!())

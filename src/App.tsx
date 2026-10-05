@@ -29,11 +29,13 @@ import { DocumentViewer }   from './components/DocumentViewer';
 import { MasterPageEditor } from './components/MasterPageEditor';
 
 import { useStore } from './store/useStore';
+import { useShallow } from 'zustand/react/shallow';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { acquirePdfDoc, releasePdfDoc, destroyAllPdfDocs } from './utils/pdfDocumentManager';
 
 // Worker URL is also set inside DocumentViewer; setting it here is idempotent
 // and ensures it's ready before any App-level PDF loading (LeftSidePanel thumbnails).
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  `//unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 // ─── Root router ─────────────────────────────────────────────────────────────
 
@@ -121,15 +123,34 @@ function App() {
   const {
     tabMetas, activeTabId,
     openTab,
-    setPageNum, documents,
+    setPageNum,
     snapEnabled, showGuides,
     selectedGuideId, guideSelectionEnabled, snapSensitivity,
     editorMode, setEditorMode, masterPages, activeMasterPageId,
     vectorSnapEnabled, centerSnapEnabled,
     savingStatus,
-  } = useStore();
+  } = useStore(
+    useShallow((s) => ({
+      tabMetas: s.tabMetas,
+      activeTabId: s.activeTabId,
+      openTab: s.openTab,
+      setPageNum: s.setPageNum,
+      snapEnabled: s.snapEnabled,
+      showGuides: s.showGuides,
+      selectedGuideId: s.selectedGuideId,
+      guideSelectionEnabled: s.guideSelectionEnabled,
+      snapSensitivity: s.snapSensitivity,
+      editorMode: s.editorMode,
+      setEditorMode: s.setEditorMode,
+      masterPages: s.masterPages,
+      activeMasterPageId: s.activeMasterPageId,
+      vectorSnapEnabled: s.vectorSnapEnabled,
+      centerSnapEnabled: s.centerSnapEnabled,
+      savingStatus: s.savingStatus,
+    }))
+  );
 
-  const doc = activeTabId ? documents[activeTabId] : null;
+  const doc = useStore((s) => (s.activeTabId ? s.documents[s.activeTabId] : null));
   const guides = doc?.guides || [];
 
   const pdfBytes = doc?.pdfBytes;
@@ -280,11 +301,17 @@ function App() {
   useEffect(() => {
     if (!pdfBytes) { setPdfDoc(null); return; }
     let cancelled = false;
-    pdfjsLib.getDocument({ data: new Uint8Array(pdfBytes.slice(0)) }).promise
+    acquirePdfDoc(pdfBytes)
       .then(pdf => { if (!cancelled) setPdfDoc(pdf); })
       .catch(() => { if (!cancelled) setPdfDoc(null); });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; releasePdfDoc(pdfBytes); };
   }, [pdfBytes]);
+
+  useEffect(() => {
+    const onUnload = () => destroyAllPdfDocs();
+    window.addEventListener('beforeunload', onUnload);
+    return () => window.removeEventListener('beforeunload', onUnload);
+  }, []);
 
   // ── File-IO callbacks ───────────────────────────────────────────────────────
 

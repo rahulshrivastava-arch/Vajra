@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useStore } from '../store/useStore';
-import * as pdfjsLib from 'pdfjs-dist';
+import { useShallow } from 'zustand/react/shallow';
 import type { MasterPage } from '../store/useStore';
+import { acquirePdfDoc, releasePdfDoc } from '../utils/pdfDocumentManager';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  `//unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+// (PDF.js worker URL is configured once in ../utils/pdfDocumentManager.)
 
 const formatPageSize = (w: number, h: number): string => {
   const matchPreset = (width: number, height: number) => {
@@ -243,7 +243,7 @@ export function RightSidePanel() {
   const [isCollapsed, setIsCollapsed] = useState(false);
 
   const {
-    activeTabId, documents, updateShape,
+    activeTabId, updateShape,
     customAssets, addCustomAsset,
     customStamps, addCustomStamp, removeCustomStamp,
     setActiveTool, setActiveStamp, activeTool, activeStamp,
@@ -253,9 +253,35 @@ export function RightSidePanel() {
     // Bleed & CMYK Exporter Actions
     setBleedOffset, setShowBleedGuides, setColorSpaceMode,
     bringToFront, sendToBack,
-  } = useStore();
+  } = useStore(
+    useShallow((s) => ({
+      activeTabId: s.activeTabId,
+      updateShape: s.updateShape,
+      customAssets: s.customAssets,
+      addCustomAsset: s.addCustomAsset,
+      customStamps: s.customStamps,
+      addCustomStamp: s.addCustomStamp,
+      removeCustomStamp: s.removeCustomStamp,
+      setActiveTool: s.setActiveTool,
+      setActiveStamp: s.setActiveStamp,
+      activeTool: s.activeTool,
+      activeStamp: s.activeStamp,
+      addShape: s.addShape,
+      strokeColor: s.strokeColor,
+      pushToHistory: s.pushToHistory,
+      masterPages: s.masterPages,
+      setMasterPageAssignment: s.setMasterPageAssignment,
+      setEditorMode: s.setEditorMode,
+      setActiveMasterPageId: s.setActiveMasterPageId,
+      setBleedOffset: s.setBleedOffset,
+      setShowBleedGuides: s.setShowBleedGuides,
+      setColorSpaceMode: s.setColorSpaceMode,
+      bringToFront: s.bringToFront,
+      sendToBack: s.sendToBack,
+    }))
+  );
 
-  const doc = activeTabId ? documents[activeTabId] : null;
+  const doc = useStore((s) => (s.activeTabId ? s.documents[s.activeTabId] : null));
   const shapes = doc?.shapes || [];
   const selectedShapeIds = doc?.selectedShapeIds || [];
 
@@ -273,10 +299,10 @@ export function RightSidePanel() {
     }
 
     let active = true;
+    const bytes = doc.pdfBytes;
     const loadSizes = async () => {
       try {
-        const lib = (window as any).pdfjsLib || pdfjsLib;
-        const pdf = await lib.getDocument({ data: new Uint8Array(doc.pdfBytes!.slice(0)) }).promise;
+        const pdf = await acquirePdfDoc(bytes);
         if (!active) return;
 
         const sizes: Record<number, { width: number; height: number }> = {};
@@ -285,6 +311,7 @@ export function RightSidePanel() {
           if (!active) return;
           const vp = page.getViewport({ scale: 1.0 });
           sizes[i] = { width: vp.width, height: vp.height };
+          page.cleanup();
         }
         if (active) {
           setDocPageSizes(sizes);
@@ -297,6 +324,7 @@ export function RightSidePanel() {
     loadSizes();
     return () => {
       active = false;
+      releasePdfDoc(bytes);
     };
   }, [doc?.pdfBytes]);
 

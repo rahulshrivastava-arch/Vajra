@@ -32,12 +32,38 @@ import type {
   DocumentState,
   Guide,
   ShapeData,
+  HistoryEntry,
 } from './types';
 
 // Re-export everything from types.ts so that existing imports like:
 //   import { useStore, type ShapeData } from './store/useStore'
 // continue to work without modification across all consumer files.
 export type { ToolType, ShapeData, MarkupState, DocumentState, TabMeta, Guide, MasterPage } from './types';
+
+// ─── History bounds ───────────────────────────────────────────────────────────
+// Undo/redo stacks were unbounded and each page-change entry pins a full copy of
+// the PDF. Cap total depth and the number of PDF-carrying (page insert/delete)
+// entries. We cut at a snapshot boundary instead of stripping bytes, so an undo
+// never restores shapes that don't match the PDF.
+const MAX_HISTORY_ENTRIES = 50;
+const MAX_PAGE_SNAPSHOTS = 5;
+
+/**
+ * Trim a history list. `newestFirst` = true for `future` (index 0 is newest),
+ * false for `past` (last index is newest).
+ */
+function trimHistory<T extends { pdfBytes?: Uint8Array }>(entries: T[], newestFirst = false): T[] {
+  let list = newestFirst ? entries.slice().reverse() : entries.slice(); // oldest -> newest
+  if (list.length > MAX_HISTORY_ENTRIES) list = list.slice(list.length - MAX_HISTORY_ENTRIES);
+  let snapshots = 0;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].pdfBytes) {
+      snapshots++;
+      if (snapshots > MAX_PAGE_SNAPSHOTS) { list = list.slice(i + 1); break; }
+    }
+  }
+  return newestFirst ? list.reverse() : list;
+}
 
 // ─── Default Document State ───────────────────────────────────────────────────
 
@@ -637,7 +663,7 @@ export const useStore = create<MarkupState>((set, get) => ({
       return {
         documents: {
           ...state.documents,
-          [state.activeTabId]: { ...doc, past: [...doc.past, { shapes: JSON.parse(JSON.stringify(doc.shapes)) }], future: [] }
+          [state.activeTabId]: { ...doc, past: trimHistory<HistoryEntry>([...doc.past, { shapes: JSON.parse(JSON.stringify(doc.shapes)) }]), future: [] }
         },
         ...(!state.activeTabId.startsWith('__master__') ? {
           tabMetas: {
@@ -654,13 +680,13 @@ export const useStore = create<MarkupState>((set, get) => ({
       const doc = state.documents[state.activeTabId];
       const entry = {
         shapes: JSON.parse(JSON.stringify(doc.shapes)),
-        pdfBytes: doc.pdfBytes ? new Uint8Array(doc.pdfBytes.slice(0)) : undefined,
+        pdfBytes: doc.pdfBytes ?? undefined, // immutable — share by reference, no copy
         pageNum: doc.pageNum
       };
       return {
         documents: {
           ...state.documents,
-          [state.activeTabId]: { ...doc, past: [...doc.past, entry], future: [] }
+          [state.activeTabId]: { ...doc, past: trimHistory([...doc.past, entry]), future: [] }
         },
         ...(!state.activeTabId.startsWith('__master__') ? {
           tabMetas: {
@@ -681,14 +707,14 @@ export const useStore = create<MarkupState>((set, get) => ({
 
       const currentEntry = {
         shapes: JSON.parse(JSON.stringify(doc.shapes)),
-        pdfBytes: doc.pdfBytes ? new Uint8Array(doc.pdfBytes.slice(0)) : undefined,
+        pdfBytes: doc.pdfBytes ?? undefined,
         pageNum: doc.pageNum
       };
 
       const updates: any = {
         shapes: previous.shapes,
         past: newPast,
-        future: [currentEntry, ...doc.future]
+        future: trimHistory([currentEntry, ...doc.future], true)
       };
 
       const rootProxyUpdates: any = {};
@@ -726,13 +752,13 @@ export const useStore = create<MarkupState>((set, get) => ({
 
       const currentEntry = {
         shapes: JSON.parse(JSON.stringify(doc.shapes)),
-        pdfBytes: doc.pdfBytes ? new Uint8Array(doc.pdfBytes.slice(0)) : undefined,
+        pdfBytes: doc.pdfBytes ?? undefined,
         pageNum: doc.pageNum
       };
 
       const updates: any = {
         shapes: next.shapes,
-        past: [...doc.past, currentEntry],
+        past: trimHistory([...doc.past, currentEntry]),
         future: newFuture
       };
 

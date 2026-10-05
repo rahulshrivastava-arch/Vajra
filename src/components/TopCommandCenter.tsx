@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useStore } from '../store/useStore';
+import { useShallow } from 'zustand/react/shallow';
 import { PatternEngine } from '../utils/PatternEngine';
 import type { ShapeData, TableCell } from '../store/types';
 import { isMarkType } from './MarksRenderer';
@@ -348,7 +349,7 @@ function MarksToolbar({ activeTool, setActiveTool }: {
   activeTool: string;
   setActiveTool: (t: any) => void;
 }) {
-  const { editorMode } = useStore();
+  const editorMode = useStore((s) => s.editorMode);
   const isMaster = editorMode === 'master';
   const themeColor = isMaster ? '#f59e0b' : '#4da6ff';
   const themeBg = isMaster ? 'rgba(245,158,11,0.18)' : 'rgba(77,166,255,0.18)';
@@ -392,7 +393,7 @@ function BuildingElementsToolbar({ activeTool, setActiveTool }: {
   activeTool: string;
   setActiveTool: (t: any) => void;
 }) {
-  const { editorMode } = useStore();
+  const editorMode = useStore((s) => s.editorMode);
   const isMaster = editorMode === 'master';
   const themeColor = isMaster ? '#f59e0b' : '#4da6ff';
   const themeBg = isMaster ? 'rgba(245,158,11,0.18)' : 'rgba(77,166,255,0.18)';
@@ -600,7 +601,13 @@ function MenuBar({ onNewDocument, undo, redo, isScaleMode, setIsScaleMode, setAc
   type Entry = { type: 'item'; label: string; input?: boolean; onClick?: () => void };
   type MenuItem = Sep | Entry;
 
-  const { editorMode, activeMasterPageId, masterPages } = useStore();
+  const { editorMode, activeMasterPageId, masterPages } = useStore(
+    useShallow((s) => ({
+      editorMode: s.editorMode,
+      activeMasterPageId: s.activeMasterPageId,
+      masterPages: s.masterPages,
+    }))
+  );
   const activeMasterName = masterPages.find(m => m.id === activeMasterPageId)?.name || 'Master';
 
   const fileItems: MenuItem[] = editorMode === 'master' ? [
@@ -934,10 +941,26 @@ export function TopCommandCenter({
 }) {
   const { 
     activeTool, setActiveTool, setScale, undo, redo, 
-    activeTabId, documents, isScaleMode, setIsScaleMode, 
+    isScaleMode, setIsScaleMode, 
     setPendingTableDimensions, editorMode, strokeColor,
     bringToFront, sendToBack
-  } = useStore();
+  } = useStore(
+    useShallow((s) => ({
+      activeTool: s.activeTool,
+      setActiveTool: s.setActiveTool,
+      setScale: s.setScale,
+      undo: s.undo,
+      redo: s.redo,
+      isScaleMode: s.isScaleMode,
+      setIsScaleMode: s.setIsScaleMode,
+      setPendingTableDimensions: s.setPendingTableDimensions,
+      editorMode: s.editorMode,
+      strokeColor: s.strokeColor,
+      bringToFront: s.bringToFront,
+      sendToBack: s.sendToBack,
+    }))
+  );
+  const doc = useStore((s) => (s.activeTabId ? s.documents[s.activeTabId] : null));
 
   const [activeRibbonTab, setActiveRibbonTab] = useState<'draw' | 'marks' | 'building_elements'>('draw');
   
@@ -994,7 +1017,6 @@ export function TopCommandCenter({
     state.setSelectedShapeIds([newShape.id]);
   };
   
-  const doc = activeTabId ? documents[activeTabId] : null;
   const past = doc?.past || [];
   const future = doc?.future || [];
   const scale = doc?.scale || 1.0;
@@ -1663,11 +1685,42 @@ function PropertiesBar() {
     arrowHeadAngle, setArrowHeadAngle,
     arrowHeadFilled, setArrowHeadFilled,
     addLabelMode, setAddLabelMode,
-    activeTabId, documents,
+    activeTabId,
     brushThickness, setBrushThickness
-  } = useStore();
+  } = useStore(
+    useShallow((s) => ({
+      activeTool: s.activeTool,
+      updateShape: s.updateShape,
+      strokeColor: s.strokeColor,
+      setStrokeColor: s.setStrokeColor,
+      strokeWidth: s.strokeWidth,
+      setStrokeWidth: s.setStrokeWidth,
+      fillColor: s.fillColor,
+      setFillColor: s.setFillColor,
+      activeDash: s.activeDash,
+      setActiveDash: s.setActiveDash,
+      polygonSides: s.polygonSides,
+      setPolygonSides: s.setPolygonSides,
+      pushToHistory: s.pushToHistory,
+      cloudMode: s.cloudMode,
+      setCloudMode: s.setCloudMode,
+      arrowHeadType: s.arrowHeadType,
+      setArrowHeadType: s.setArrowHeadType,
+      arrowHeadSize: s.arrowHeadSize,
+      setArrowHeadSize: s.setArrowHeadSize,
+      arrowHeadAngle: s.arrowHeadAngle,
+      setArrowHeadAngle: s.setArrowHeadAngle,
+      arrowHeadFilled: s.arrowHeadFilled,
+      setArrowHeadFilled: s.setArrowHeadFilled,
+      addLabelMode: s.addLabelMode,
+      setAddLabelMode: s.setAddLabelMode,
+      activeTabId: s.activeTabId,
+      brushThickness: s.brushThickness,
+      setBrushThickness: s.setBrushThickness,
+    }))
+  );
   
-  const doc = activeTabId ? documents[activeTabId] : null;
+  const doc = useStore((s) => (s.activeTabId ? s.documents[s.activeTabId] : null));
   const shapes = doc?.shapes || [];
   const selectedShapeIds = doc?.selectedShapeIds || [];
 

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useStore } from '../store/useStore';
+import { useShallow } from 'zustand/react/shallow';
 
 export function MarkupLedger() {
   const [isMinimized, setIsMinimized] = useState(true);
@@ -8,8 +9,14 @@ export function MarkupLedger() {
   const [commentBuffer, setCommentBuffer] = useState<string>('');
   const [showAllMarkups, setShowAllMarkups] = useState(false);
   
-  const { activeTabId, documents, setSelectedShapeIds, deleteShape, updateShape } = useStore();
-  const doc = activeTabId ? documents[activeTabId] : null;
+  const { setSelectedShapeIds, deleteShape, updateShape } = useStore(
+    useShallow((s) => ({
+      setSelectedShapeIds: s.setSelectedShapeIds,
+      deleteShape: s.deleteShape,
+      updateShape: s.updateShape,
+    }))
+  );
+  const doc = useStore((s) => (s.activeTabId ? s.documents[s.activeTabId] : null));
   const shapes = doc?.shapes || [];
   const selectedShapeIds = doc?.selectedShapeIds || [];
 

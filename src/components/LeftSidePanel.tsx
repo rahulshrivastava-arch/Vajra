@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { useStore, type ShapeData } from '../store/useStore';
+import { useShallow } from 'zustand/react/shallow';
 import { renderShapesOnCanvas } from '../utils/canvasRenderer';
 import { isLineMark } from './MarksRenderer';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -26,18 +27,71 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
     isInsideSpread: boolean;
   } | null>(null);
 
-  const { activeTabId, documents, setLayerVisible, setSelectedShapeIds } = useStore();
-
-  
-  const doc = activeTabId ? documents[activeTabId] : null;
+  const { setLayerVisible, setSelectedShapeIds } = useStore(
+    useShallow((s) => ({
+      setLayerVisible: s.setLayerVisible,
+      setSelectedShapeIds: s.setSelectedShapeIds,
+    }))
+  );
+  // Subscribe only to the active tab's document, not the whole documents map.
+  const doc = useStore((s) => (s.activeTabId ? s.documents[s.activeTabId] : null));
   const shapes = doc?.shapes || [];
   const selectedShapeIds = doc?.selectedShapeIds || [];
   const layersVisible = doc?.layersVisible || { base: true, active: true, chest: true };
 
-
-  const baseCanvasesRef = useRef<HTMLCanvasElement[]>([]);
+  // Lazy-thumbnail state
+  const MAX_BASE_CANVASES = 40;
+  const baseCacheRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  const pageWidthsRef = useRef<{ doc: any; widths: number[] } | null>(null);
   const prevPageShapesJsonRef = useRef<Record<number, string>>({});
   const masterBgCanvasesRef = useRef<Record<string, HTMLCanvasElement>>({});
+
+  // Visibility tracking (which thumbnail slots are near the viewport)
+  const [visibleTick, setVisibleTick] = useState(0);
+  const visibleRef = useRef<Set<number>>(new Set());
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const thumbElsRef = useRef<Map<number, HTMLElement>>(new Map());
+  const thumbRefCbsRef = useRef<Map<number, (el: HTMLElement | null) => void>>(new Map());
+
+  useEffect(() => () => { observerRef.current?.disconnect(); observerRef.current = null; }, []);
+
+  /** Stable (per page index) ref callback that registers a thumbnail slot with the observer. */
+  const observeThumb = (idx: number) => {
+    let cb = thumbRefCbsRef.current.get(idx);
+    if (cb) return cb;
+    cb = (el: HTMLElement | null) => {
+      if (!observerRef.current) {
+        observerRef.current = new IntersectionObserver((entries) => {
+          let changed = false;
+          for (const e of entries) {
+            const i = Number((e.target as HTMLElement).dataset.thumb);
+            if (Number.isNaN(i)) continue;
+            if (e.isIntersecting) {
+              if (!visibleRef.current.has(i)) { visibleRef.current.add(i); changed = true; }
+            } else if (visibleRef.current.delete(i)) {
+              changed = true;
+            }
+          }
+          if (changed) setVisibleTick((t) => t + 1);
+        }, { rootMargin: '300px' });
+      }
+      const obs = observerRef.current;
+      const prev = thumbElsRef.current.get(idx);
+      if (!el) {
+        if (prev) obs.unobserve(prev);
+        thumbElsRef.current.delete(idx);
+        if (visibleRef.current.delete(idx)) setVisibleTick((t) => t + 1);
+        return;
+      }
+      if (prev === el) return;
+      if (prev) obs.unobserve(prev);
+      el.dataset.thumb = String(idx);
+      thumbElsRef.current.set(idx, el);
+      obs.observe(el);
+    };
+    thumbRefCbsRef.current.set(idx, cb);
+    return cb;
+  };
 
   const getPageSideInSpread = (pNum: number, isSpreadMode: boolean, cover: boolean): 'left' | 'right' => {
     if (!isSpreadMode) return 'left';
@@ -65,6 +119,8 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
       canvas.height = vp.height;
       const ctx = canvas.getContext('2d')!;
       await page.render({ canvasContext: ctx, canvas, viewport: vp }).promise;
+      page.cleanup();
+      pdf.destroy().catch(() => {}); // canvas is cached; free the temporary document
       masterBgCanvasesRef.current[key] = canvas;
       return canvas;
     } catch (err) {
@@ -126,246 +182,161 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
     return filtered;
   };
 
-  useEffect(() => {
-    if (!pdfDoc) {
-      baseCanvasesRef.current = [];
-      prevPageShapesJsonRef.current = {};
-      masterBgCanvasesRef.current = {};
-      setThumbnails([]);
-      return;
-    }
-    let cancelled = false;
-    const cacheBasePages = async () => {
-      const canvases: HTMLCanvasElement[] = [];
-      const initialThumbs: string[] = [];
-      prevPageShapesJsonRef.current = {};
-      
-      // Pre-fetch viewport widths for all pages to duplicate crossing shapes correctly
-      const mockOriginalPages: any[] = [];
-      try {
-        for (let p = 1; p <= pdfDoc.numPages; p++) {
-          const page = await pdfDoc.getPage(p);
-          const vp = page.getViewport({ scale: 1.0 });
-          mockOriginalPages.push({
-            getSize: () => ({ width: vp.width })
-          });
-        }
-      } catch (err) {
-        console.error("Error pre-fetching page viewports:", err);
-      }
+  // ── Lazy thumbnail pipeline ───────────────────────────────────────────────
+  // Only the current page and pages near the visible scroll window are rendered
+  // (sequentially, yielding to the UI between pages). Each page is re-rendered
+  // only when its own signature (shapes + master info) changes, and edits are
+  // debounced so dragging a markup doesn't thrash the pipeline.
 
-      const duplicatedShapes = duplicateSpreadCrossingShapes(
-        shapes,
-        isSpread,
-        hasFrontCover,
-        pdfDoc.numPages,
-        mockOriginalPages
-      );
-      
-      for (let i = 1; i <= pdfDoc.numPages; i++) {
-        if (cancelled) return;
-        try {
-          const page = await pdfDoc.getPage(i);
-          const vp = page.getViewport({ scale: 0.25 });
-          const canvas = document.createElement('canvas');
-          canvas.width = vp.width;
-          canvas.height = vp.height;
-          const ctx = canvas.getContext('2d')!;
-          await page.render({ canvasContext: ctx, canvas, viewport: vp }).promise;
-          canvases.push(canvas);
-          
-          const pageW = canvas.width / 0.25;
-          const pageH = canvas.height / 0.25;
-          
-          const masterId = doc?.masterPageAssignments?.[i] ?? null;
-          const master = masterId ? (doc?.masterPages || []).find(m => m.id === masterId) : null;
-          
-          const tempCanvas = document.createElement('canvas');
-          tempCanvas.width = canvas.width;
-          tempCanvas.height = canvas.height;
-          const tempCtx = tempCanvas.getContext('2d')!;
-          
-          tempCtx.fillStyle = '#ffffff';
-          tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-          
-          if (master?.backgroundPdfBytes) {
-            const bgCanvas = await getOrLoadMasterBgCanvas(master, 0.25);
-            if (bgCanvas) {
-              const isRight = getPageSideInSpread(i, isSpread, hasFrontCover) === 'right';
-              if (master.isSpread) {
-                const sw = bgCanvas.width / 2;
-                const sh = bgCanvas.height;
-                const sx = isRight ? bgCanvas.width / 2 : 0;
-                const sy = 0;
-                const dw = master.pageWidth * 0.25;
-                const dh = master.pageHeight * 0.25;
-                const dx = ((pageW - master.pageWidth) / 2) * 0.25;
-                const dy = ((pageH - master.pageHeight) / 2) * 0.25;
-                tempCtx.drawImage(bgCanvas, sx, sy, sw, sh, dx, dy, dw, dh);
-              } else {
-                const sw = bgCanvas.width;
-                const sh = bgCanvas.height;
-                const sx = 0;
-                const sy = 0;
-                const dw = master.pageWidth * 0.25;
-                const dh = master.pageHeight * 0.25;
-                const dx = ((pageW - master.pageWidth) / 2) * 0.25;
-                const dy = ((pageH - master.pageHeight) / 2) * 0.25;
-                tempCtx.drawImage(bgCanvas, sx, sy, sw, sh, dx, dy, dw, dh);
-              }
+  // 1) Reset all per-document caches whenever the PDF changes.
+  useEffect(() => {
+    prevPageShapesJsonRef.current = {};
+    baseCacheRef.current.clear();
+    masterBgCanvasesRef.current = {};
+    pageWidthsRef.current = null;
+    setThumbnails(pdfDoc ? new Array(pdfDoc.numPages).fill('') : []);
+  }, [pdfDoc]);
+
+  // 2) Generate thumbnails for the pages that matter right now.
+  useEffect(() => {
+    if (!pdfDoc) return;
+    let cancelled = false;
+    const numPages: number = pdfDoc.numPages;
+    const hasAny = Object.keys(prevPageShapesJsonRef.current).length > 0;
+
+    const run = async () => {
+      try {
+        // Page widths are only needed to duplicate spread-crossing shapes.
+        let originalPages: any[] = [];
+        if (isSpread) {
+          let cache = pageWidthsRef.current;
+          if (!cache || cache.doc !== pdfDoc) {
+            const widths: number[] = [];
+            for (let p = 1; p <= numPages; p++) {
+              const page = await pdfDoc.getPage(p);
+              widths.push(page.getViewport({ scale: 1.0 }).width);
+              page.cleanup();
+              if (cancelled) return;
             }
+            cache = { doc: pdfDoc, widths };
+            pageWidthsRef.current = cache;
           }
-          
-          tempCtx.drawImage(canvas, 0, 0);
-          
-          if (master) {
-            const isRight = getPageSideInSpread(i, isSpread, hasFrontCover) === 'right';
-            const masterShapes = getMasterShapesForPage(master, isRight, pageW, pageH);
-            await renderShapesOnCanvas(tempCtx, masterShapes, 0.25, true);
-          }
-          
+          originalPages = cache.widths.map((width) => ({ getSize: () => ({ width }) }));
+        }
+
+        const duplicatedShapes = duplicateSpreadCrossingShapes(
+          shapes, isSpread, hasFrontCover, numPages, originalPages
+        );
+
+        // Current page first, then nearest-visible pages.
+        const wanted = new Set<number>([pageNum]);
+        visibleRef.current.forEach((idx) => wanted.add(idx + 1));
+        const order = [...wanted]
+          .filter((p) => p >= 1 && p <= numPages)
+          .sort((a, b) => Math.abs(a - pageNum) - Math.abs(b - pageNum));
+
+        for (const i of order) {
+          if (cancelled) return;
+
+          const masterId = doc?.masterPageAssignments?.[i] ?? null;
+          const master = masterId ? (doc?.masterPages || []).find((m) => m.id === masterId) : null;
           const pageShapes = duplicatedShapes.filter((s: ShapeData) => s.page === i);
-          const cacheObj = {
+          const signature = JSON.stringify({
             pageShapes,
             masterId,
             masterName: master?.name,
             masterShapes: master?.shapes,
             masterBgPdf: master?.backgroundPdfBytes ? master.backgroundPdfBytes.length : 0,
-            masterBgPageNum: master?.backgroundPageNum
-          };
-          prevPageShapesJsonRef.current[i] = JSON.stringify(cacheObj);
-          await renderShapesOnCanvas(tempCtx, pageShapes, 0.25, true);
-          
-          initialThumbs.push(tempCanvas.toDataURL('image/jpeg', 0.7));
-          if (!cancelled) setThumbnails([...initialThumbs]);
-        } catch (err) {
-          console.error("Error caching page thumbnail:", err);
-          canvases.push(null as any);
-          initialThumbs.push('');
-          if (!cancelled) setThumbnails([...initialThumbs]);
-        }
-      }
-      if (!cancelled) {
-        baseCanvasesRef.current = canvases;
-      }
-    };
-    cacheBasePages();
-    return () => {
-      cancelled = true;
-    };
-  }, [pdfDoc, doc?.masterPageAssignments, doc?.masterPages, isSpread, hasFrontCover]);
+            masterBgPageNum: master?.backgroundPageNum,
+            isSpread,
+            hasFrontCover,
+          });
+          if (prevPageShapesJsonRef.current[i] === signature) continue;
 
-  useEffect(() => {
-    if (!pdfDoc || baseCanvasesRef.current.length === 0) return;
-    
-    let cancelled = false;
-    const updateWithShapes = async () => {
-      const updatedThumbs = [...thumbnails];
-      let changed = false;
-      
-      const mockOriginalPages = baseCanvasesRef.current.map(canvas => {
-        const width = canvas ? canvas.width / 0.25 : 612;
-        return {
-          getSize: () => ({ width })
-        };
-      });
-      
-      const duplicatedShapes = duplicateSpreadCrossingShapes(
-        shapes,
-        isSpread,
-        hasFrontCover,
-        pdfDoc.numPages,
-        mockOriginalPages
-      );
-      
-      for (let i = 1; i <= pdfDoc.numPages; i++) {
-        const baseCanvas = baseCanvasesRef.current[i - 1];
-        if (!baseCanvas) continue;
-        
-        const masterId = doc?.masterPageAssignments?.[i] ?? null;
-        const master = masterId ? (doc?.masterPages || []).find(m => m.id === masterId) : null;
-        
-        const pageShapes = duplicatedShapes.filter((s: ShapeData) => s.page === i);
-        const cacheObj = {
-          pageShapes,
-          masterId,
-          masterName: master?.name,
-          masterShapes: master?.shapes,
-          masterBgPdf: master?.backgroundPdfBytes ? master.backgroundPdfBytes.length : 0,
-          masterBgPageNum: master?.backgroundPageNum
-        };
-        const shapesJson = JSON.stringify(cacheObj);
-        
-        if (prevPageShapesJsonRef.current[i] === shapesJson && updatedThumbs[i - 1]) {
-          continue;
-        }
-        
-        prevPageShapesJsonRef.current[i] = shapesJson;
-        
-        const pageW = baseCanvas.width / 0.25;
-        const pageH = baseCanvas.height / 0.25;
-        
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = baseCanvas.width;
-        tempCanvas.height = baseCanvas.height;
-        const tempCtx = tempCanvas.getContext('2d')!;
-        
-        tempCtx.fillStyle = '#ffffff';
-        tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-        
-        if (master?.backgroundPdfBytes) {
-          const bgCanvas = await getOrLoadMasterBgCanvas(master, 0.25);
-          if (bgCanvas) {
-            const isRight = getPageSideInSpread(i, isSpread, hasFrontCover) === 'right';
-            if (master.isSpread) {
-              const sw = bgCanvas.width / 2;
-              const sh = bgCanvas.height;
-              const sx = isRight ? bgCanvas.width / 2 : 0;
-              const sy = 0;
-              const dw = master.pageWidth * 0.25;
-              const dh = master.pageHeight * 0.25;
-              const dx = ((pageW - master.pageWidth) / 2) * 0.25;
-              const dy = ((pageH - master.pageHeight) / 2) * 0.25;
-              tempCtx.drawImage(bgCanvas, sx, sy, sw, sh, dx, dy, dw, dh);
-            } else {
-              const sw = bgCanvas.width;
-              const sh = bgCanvas.height;
-              const sx = 0;
-              const sy = 0;
-              const dw = master.pageWidth * 0.25;
-              const dh = master.pageHeight * 0.25;
-              const dx = ((pageW - master.pageWidth) / 2) * 0.25;
-              const dy = ((pageH - master.pageHeight) / 2) * 0.25;
-              tempCtx.drawImage(bgCanvas, sx, sy, sw, sh, dx, dy, dw, dh);
+          try {
+            // Base page raster (bounded cache so edits to one page are cheap).
+            let baseCanvas = baseCacheRef.current.get(i);
+            if (!baseCanvas) {
+              const page = await pdfDoc.getPage(i);
+              const vp = page.getViewport({ scale: 0.25 });
+              baseCanvas = document.createElement('canvas');
+              baseCanvas.width = vp.width;
+              baseCanvas.height = vp.height;
+              await page.render({ canvasContext: baseCanvas.getContext('2d')!, canvas: baseCanvas, viewport: vp }).promise;
+              page.cleanup();
+              if (cancelled) return;
+              const cache = baseCacheRef.current;
+              cache.set(i, baseCanvas);
+              if (cache.size > MAX_BASE_CANVASES) {
+                const oldest = cache.keys().next().value;
+                if (oldest !== undefined) cache.delete(oldest);
+              }
             }
+
+            const pageW = baseCanvas.width / 0.25;
+            const pageH = baseCanvas.height / 0.25;
+
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = baseCanvas.width;
+            tempCanvas.height = baseCanvas.height;
+            const tempCtx = tempCanvas.getContext('2d')!;
+            tempCtx.fillStyle = '#ffffff';
+            tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+
+            if (master?.backgroundPdfBytes) {
+              const bgCanvas = await getOrLoadMasterBgCanvas(master, 0.25);
+              if (bgCanvas) {
+                const isRight = getPageSideInSpread(i, isSpread, hasFrontCover) === 'right';
+                const sw = master.isSpread ? bgCanvas.width / 2 : bgCanvas.width;
+                const sh = bgCanvas.height;
+                const sx = master.isSpread && isRight ? bgCanvas.width / 2 : 0;
+                const dw = master.pageWidth * 0.25;
+                const dh = master.pageHeight * 0.25;
+                const dx = ((pageW - master.pageWidth) / 2) * 0.25;
+                const dy = ((pageH - master.pageHeight) / 2) * 0.25;
+                tempCtx.drawImage(bgCanvas, sx, 0, sw, sh, dx, dy, dw, dh);
+              }
+            }
+
+            tempCtx.drawImage(baseCanvas, 0, 0);
+
+            if (master) {
+              const isRight = getPageSideInSpread(i, isSpread, hasFrontCover) === 'right';
+              const masterShapes = getMasterShapesForPage(master, isRight, pageW, pageH);
+              await renderShapesOnCanvas(tempCtx, masterShapes, 0.25, true);
+            }
+            await renderShapesOnCanvas(tempCtx, pageShapes, 0.25, true);
+
+            if (cancelled) return;
+            prevPageShapesJsonRef.current[i] = signature;
+            const url = tempCanvas.toDataURL('image/jpeg', 0.7);
+            setThumbnails((old) => {
+              if (old.length !== numPages) return old;
+              const next = old.slice();
+              next[i - 1] = url;
+              return next;
+            });
+          } catch (err) {
+            console.error('Error generating page thumbnail:', err);
+            prevPageShapesJsonRef.current[i] = signature; // don't retry in a tight loop
           }
+
+          // Yield so the UI stays responsive between pages.
+          await new Promise((r) => setTimeout(r, 0));
         }
-        
-        tempCtx.drawImage(baseCanvas, 0, 0);
-        
-        if (master) {
-          const isRight = getPageSideInSpread(i, isSpread, hasFrontCover) === 'right';
-          const masterShapes = getMasterShapesForPage(master, isRight, pageW, pageH);
-          await renderShapesOnCanvas(tempCtx, masterShapes, 0.25, true);
-        }
-        
-        await renderShapesOnCanvas(tempCtx, pageShapes, 0.25, true);
-        
-        const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.7);
-        updatedThumbs[i - 1] = dataUrl;
-        changed = true;
-      }
-      
-      if (changed && !cancelled) {
-        setThumbnails(updatedThumbs);
+      } catch (err) {
+        console.error('Thumbnail pipeline error:', err);
       }
     };
-    
-    updateWithShapes();
+
+    // Debounce edits (e.g. dragging a markup); first paint is immediate.
+    const timer = setTimeout(run, hasAny ? 250 : 0);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
-  }, [shapes, pdfDoc, thumbnails.length, doc?.masterPageAssignments, doc?.masterPages, isSpread, hasFrontCover]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdfDoc, shapes, doc?.masterPageAssignments, doc?.masterPages, isSpread, hasFrontCover, pageNum, visibleTick]);
 
   // ── Handlers ────────────────────────────────────────────────────────────────
   const handleInsertClick = async (afterIndex: number, isInsideSpread = false) => {
@@ -642,7 +613,7 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
                             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
                               {renderLeftPage ? (
                                 <>
-                                  <div onClick={() => setActiveSpreadIndex(spreadIdx)} style={{ width: '100%', border: isActive ? '2px solid #4da6ff' : '2px solid #2a2a2e', borderRadius: 5, overflow: 'hidden', cursor: 'pointer', background: '#fff' }}>
+                                  <div ref={observeThumb(leftPageIndex!)} onClick={() => setActiveSpreadIndex(spreadIdx)} style={{ width: '100%', border: isActive ? '2px solid #4da6ff' : '2px solid #2a2a2e', borderRadius: 5, overflow: 'hidden', cursor: 'pointer', background: '#fff' }}>
                                     {thumbnails[leftPageIndex!] ? <img src={thumbnails[leftPageIndex!]} style={{ width: '100%', display: 'block' }} /> : <div style={{ height: 60, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{leftPageIndex! + 1}</div>}
                                   </div>
                                   <div style={{ fontSize: 10, color: '#888', paddingTop: 4 }}>p. {leftPageIndex! + 1}</div>
@@ -668,7 +639,7 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
                             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
                               {renderRightPage ? (
                                 <>
-                                  <div onClick={() => setActiveSpreadIndex(spreadIdx)} style={{ width: '100%', border: isActive ? '2px solid #4da6ff' : '2px solid #2a2a2e', borderRadius: 5, overflow: 'hidden', cursor: 'pointer', background: '#fff' }}>
+                                  <div ref={observeThumb(rightPageIndex!)} onClick={() => setActiveSpreadIndex(spreadIdx)} style={{ width: '100%', border: isActive ? '2px solid #4da6ff' : '2px solid #2a2a2e', borderRadius: 5, overflow: 'hidden', cursor: 'pointer', background: '#fff' }}>
                                     {thumbnails[rightPageIndex!] ? <img src={thumbnails[rightPageIndex!]} style={{ width: '100%', display: 'block' }} /> : <div style={{ height: 60, background: '#1a1b1f' }}></div>}
                                   </div>
                                   <div style={{ fontSize: 10, color: '#888', paddingTop: 4 }}>p. {rightPageIndex! + 1}</div>
@@ -727,7 +698,7 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
               ) : (
                 thumbnails.map((thumb, i) => (
                   <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                    <div onClick={() => setPageNum(i + 1)} style={{ width: '100%', border: pageNum === i + 1 ? '2px solid #4da6ff' : '2px solid #2a2a2e', borderRadius: 5, overflow: 'hidden', cursor: 'pointer', background: '#fff' }}>
+                    <div ref={observeThumb(i)} onClick={() => setPageNum(i + 1)} style={{ width: '100%', border: pageNum === i + 1 ? '2px solid #4da6ff' : '2px solid #2a2a2e', borderRadius: 5, overflow: 'hidden', cursor: 'pointer', background: '#fff' }}>
                       {thumb ? <img src={thumb} style={{ width: '100%', display: 'block' }} /> : <div style={{ height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{i + 1}</div>}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', width: '100%', paddingTop: 3, paddingBottom: 2 }}>

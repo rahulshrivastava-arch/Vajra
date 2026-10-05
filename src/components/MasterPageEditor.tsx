@@ -11,6 +11,7 @@
 
 import { useRef, useState, useEffect } from 'react';
 import { useStore } from '../store/useStore';
+import { useShallow } from 'zustand/react/shallow';
 import type { MasterPage } from '../store/useStore';
 
 const AMBER = '#f59e0b';
@@ -43,7 +44,17 @@ export function MasterPageEditor() {
     updateMasterPage,
     deleteMasterPage,
     setEditorMode,
-  } = useStore();
+  } = useStore(
+    useShallow((s) => ({
+      masterPages: s.masterPages,
+      activeMasterPageId: s.activeMasterPageId,
+      setActiveMasterPageId: s.setActiveMasterPageId,
+      addMasterPage: s.addMasterPage,
+      updateMasterPage: s.updateMasterPage,
+      deleteMasterPage: s.deleteMasterPage,
+      setEditorMode: s.setEditorMode,
+    }))
+  );
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newName, setNewName] = useState('');

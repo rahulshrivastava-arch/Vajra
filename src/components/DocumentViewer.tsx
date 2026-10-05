@@ -27,7 +27,9 @@ import {
   Text, Group, Path, Shape, RegularPolygon
 } from 'react-konva';
 import { useStore } from '../store/useStore';
+import { useShallow } from 'zustand/react/shallow';
 import { usePdfBytes } from '../store/useDocumentStore';
+import { acquirePdfDoc, releasePdfDoc } from '../utils/pdfDocumentManager';
 import type { ShapeData, Guide } from '../store/types';
 import { PatternEngine } from '../utils/PatternEngine';
 import { extractVectorsFromOps, GridSpatialIndex, getNearestPointOnSegment } from '../utils/vectorSnapper';
@@ -38,11 +40,7 @@ import { MasterUnderlayLayer, MasterBgCanvas } from './MasterPageUnderlay';
 import { deserializeMasterPages } from '../utils/pdfExporter';
 import { getSpreads } from '../utils/spreadLayout';
 
-// ─── One-time PDF.js worker bootstrap ────────────────────────────────────────
-// Setting workerSrc is idempotent — safe to run in every module that imports
-// pdfjsLib, since the worker is launched only once by the browser.
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  `//unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+// (Worker URL is configured once in ../utils/pdfDocumentManager.)
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -656,7 +654,7 @@ interface DocumentViewerProps {
   isActive: boolean;
 }
 
-export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
+export const DocumentViewer = React.memo(function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
 
   // ── Local state ─────────────────────────────────────────────────────────────
 
@@ -757,6 +755,8 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
   const savingStatus = useStore((s) => s.savingStatus?.[tabId] ?? null);
 
   // Root-level proxies — always reflect the ACTIVE tab.
+  // Selector + shallow compare: re-render only when one of these fields changes,
+  // and subscribe to ONLY this tab's document (not the whole `documents` map).
   const {
     activeTool,
     addShape, updateShape,
@@ -766,15 +766,29 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
     isScaleMode,
     setPageNum,
     setNumPages,
-    documents,
     brushThickness,
     showGuides, snapEnabled,
     selectedGuideId, setSelectedGuideId, guideSelectionEnabled, snapSensitivity,
     masterPages: storeMasterPages,
     centerSnapEnabled,
-  } = useStore();
+  } = useStore(useShallow((s) => ({
+    activeTool: s.activeTool,
+    addShape: s.addShape, updateShape: s.updateShape,
+    strokeColor: s.strokeColor, strokeWidth: s.strokeWidth, activeDash: s.activeDash,
+    setSelectedShapeIds: s.setSelectedShapeIds,
+    pushToHistory: s.pushToHistory, deleteShapes: s.deleteShapes,
+    isScaleMode: s.isScaleMode,
+    setPageNum: s.setPageNum,
+    setNumPages: s.setNumPages,
+    brushThickness: s.brushThickness,
+    showGuides: s.showGuides, snapEnabled: s.snapEnabled,
+    selectedGuideId: s.selectedGuideId, setSelectedGuideId: s.setSelectedGuideId,
+    guideSelectionEnabled: s.guideSelectionEnabled, snapSensitivity: s.snapSensitivity,
+    masterPages: s.masterPages,
+    centerSnapEnabled: s.centerSnapEnabled,
+  })));
 
-  const doc = documents[tabId];
+  const doc = useStore((s) => s.documents[tabId]);
   const masterPages = doc?.masterPages || storeMasterPages || [];
   const shapes = doc?.shapes || [];
   const selectedShapeIds = doc?.selectedShapeIds || [];
@@ -1689,8 +1703,9 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
     if (!pdfBytes) { setPdfDoc(null); return; }
 
     let cancelled = false;
-    const arrayCopy = new Uint8Array(pdfBytes.slice(0));
-    pdfBytesRef.current = arrayCopy;
+    // Store bytes are immutable (replaced, never mutated) so no defensive copy is
+    // needed here; consumers that hand bytes out (getRawPdfBytes) copy on demand.
+    pdfBytesRef.current = pdfBytes;
 
     // Expose bytes globally so TopCommandCenter's save pipeline can read them
     // without an imperative ref tunnel.  Only the ACTIVE viewer's bytes should
@@ -1702,7 +1717,7 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
 
     const loadPdf = async () => {
       try {
-        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayCopy) }).promise;
+        const pdf = await acquirePdfDoc(pdfBytes);
         if (cancelled) return;
 
         // ── Embedded-markup extraction (round-trip editability) ──────────────
@@ -1802,7 +1817,7 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
     };
 
     loadPdf();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; releasePdfDoc(pdfBytes); };
     // isActive intentionally omitted — we want bytes to load eagerly even for
     // inactive tabs so the switch is instant.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1839,6 +1854,15 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
 
         pageVectorsRef.current[p] = segments;
         pageGridIndicesRef.current[p] = new GridSpatialIndex(segments);
+
+        // Evict pages farther than 5 from current page to keep memory bounded
+        Object.keys(pageVectorsRef.current).forEach((pageKey) => {
+          const k = Number(pageKey);
+          if (Math.abs(k - pageNum) > 5) {
+            delete pageVectorsRef.current[k];
+            delete pageGridIndicesRef.current[k];
+          }
+        });
         console.log(`[Vector Snapper] Page ${p} loaded: ${segments.length} vector segments extracted.`);
       } catch (err) {
         console.error(`Failed to load vector data for page ${p}:`, err);
@@ -3848,11 +3872,20 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
+  if (!isActive) {
+    return (
+      <main
+        className="workspace"
+        ref={workspaceRef as any}
+        style={{ display: 'none' }}
+      />
+    );
+  }
+
   return (
     <main
       className="workspace"
       ref={workspaceRef as any}
-      style={isActive ? undefined : { display: 'none' }}
       onMouseDown={handleWorkspaceMouseDown}
     >
       {savingStatus && (
@@ -4072,7 +4105,7 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
                           behind the Konva canvas stack. Pointer-events: none. Tracks panOffset.
                           In spread mode, renders for both left and right pages. */}
                      {(() => {
-                       const doc = documents[tabId];
+                       // `doc` = this tab's document (subscribed above)
                        const assignments = doc?.masterPageAssignments || {};
                        const pageW = pdfNativeSizeRef.current?.w || 612;
                        const pageH = pdfNativeSizeRef.current?.h || 792;
@@ -6492,4 +6525,4 @@ export function DocumentViewer({ tabId, isActive }: DocumentViewerProps) {
       )}
     </main>
   );
-}
+});
