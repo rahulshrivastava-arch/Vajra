@@ -10,6 +10,7 @@ import { NewDocumentDialog } from './NewDocumentDialog';
 import { InsertPdfPagesDialog } from './InsertPdfPagesDialog';
 import { getSpreads } from '../utils/spreadLayout';
 import { duplicateSpreadCrossingShapes } from '../utils/pdfExporter';
+import { acquirePdfDoc, releasePdfDoc } from '../utils/pdfDocumentManager';
 
 
 export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontCover, hasBackCover, activeSpreadIndex, setActiveSpreadIndex, onInsertPages, onDeletePage, onDeleteSpread, onAddBlankPage }: any) {
@@ -110,7 +111,7 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
     }
     if (!master.backgroundPdfBytes) return null;
     try {
-      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(master.backgroundPdfBytes.slice(0)) }).promise;
+      const pdf = await acquirePdfDoc(master.backgroundPdfBytes);
       const pageIdx = Math.max(1, Math.min(master.backgroundPageNum, pdf.numPages));
       const page = await pdf.getPage(pageIdx);
       const vp = page.getViewport({ scale });
@@ -120,11 +121,12 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
       const ctx = canvas.getContext('2d')!;
       await page.render({ canvasContext: ctx, canvas, viewport: vp }).promise;
       page.cleanup();
-      pdf.destroy().catch(() => {}); // canvas is cached; free the temporary document
+      releasePdfDoc(master.backgroundPdfBytes);
       masterBgCanvasesRef.current[key] = canvas;
       return canvas;
     } catch (err) {
       console.error("Error loading master background PDF:", err);
+      releasePdfDoc(master.backgroundPdfBytes);
       return null;
     }
   };
@@ -208,16 +210,15 @@ export function LeftSidePanel({ pdfDoc, pageNum, setPageNum, isSpread, hasFrontC
       try {
         // Page widths are only needed to duplicate spread-crossing shapes.
         let originalPages: any[] = [];
-        if (isSpread) {
+        if (isSpread && shapes.length > 0) {
           let cache = pageWidthsRef.current;
           if (!cache || cache.doc !== pdfDoc) {
-            const widths: number[] = [];
-            for (let p = 1; p <= numPages; p++) {
-              const page = await pdfDoc.getPage(p);
-              widths.push(page.getViewport({ scale: 1.0 }).width);
-              page.cleanup();
-              if (cancelled) return;
-            }
+            // Load page 1 width as fast baseline instead of querying all 30+ pages
+            const page1 = await pdfDoc.getPage(1);
+            const defaultW = page1.getViewport({ scale: 1.0 }).width;
+            page1.cleanup();
+            if (cancelled) return;
+            const widths: number[] = new Array(numPages).fill(defaultW);
             cache = { doc: pdfDoc, widths };
             pageWidthsRef.current = cache;
           }

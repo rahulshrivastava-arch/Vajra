@@ -292,41 +292,67 @@ export function RightSidePanel() {
   const [docPageSizes, setDocPageSizes] = useState<Record<number, { width: number; height: number }>>({});
   const [splitSpreads, setSplitSpreads] = useState<Record<number, boolean>>({});
 
+  // Reset page sizes when PDF bytes change
   useEffect(() => {
-    if (!doc?.pdfBytes) {
-      setDocPageSizes({});
-      return;
-    }
+    setDocPageSizes({});
+  }, [doc?.pdfBytes]);
+
+  // 1. High priority: Load the current page's size immediately on demand
+  useEffect(() => {
+    if (!doc?.pdfBytes || !doc?.pageNum) return;
+    const pNum = doc.pageNum;
+    if (docPageSizes[pNum]) return;
 
     let active = true;
     const bytes = doc.pdfBytes;
-    const loadSizes = async () => {
+    acquirePdfDoc(bytes).then(async (pdf) => {
+      if (!active) return;
       try {
-        const pdf = await acquirePdfDoc(bytes);
+        const page = await pdf.getPage(pNum);
         if (!active) return;
-
-        const sizes: Record<number, { width: number; height: number }> = {};
-        for (let i = 1; i <= pdf.numPages; i++) {
-          const page = await pdf.getPage(i);
-          if (!active) return;
-          const vp = page.getViewport({ scale: 1.0 });
-          sizes[i] = { width: vp.width, height: vp.height };
-          page.cleanup();
-        }
-        if (active) {
-          setDocPageSizes(sizes);
-        }
+        const vp = page.getViewport({ scale: 1.0 });
+        setDocPageSizes(prev => (prev[pNum] ? prev : { ...prev, [pNum]: { width: vp.width, height: vp.height } }));
+        page.cleanup();
       } catch (err) {
-        console.error("Error loading PDF page sizes for mismatch checks:", err);
+        console.error("Error loading active page size:", err);
       }
-    };
+    }).catch(() => {});
 
-    loadSizes();
     return () => {
       active = false;
       releasePdfDoc(bytes);
     };
-  }, [doc?.pdfBytes]);
+  }, [doc?.pdfBytes, doc?.pageNum, !!docPageSizes[doc?.pageNum ?? 1]]);
+
+  // 2. Background: Load remaining page sizes sequentially only when the Masters tab is opened
+  useEffect(() => {
+    if (!doc?.pdfBytes || activeTab !== 'Masters') return;
+
+    let active = true;
+    const bytes = doc.pdfBytes;
+    acquirePdfDoc(bytes).then(async (pdf) => {
+      if (!active) return;
+      try {
+        for (let i = 1; i <= pdf.numPages; i++) {
+          if (!active) break;
+          const page = await pdf.getPage(i);
+          if (!active) { page.cleanup(); break; }
+          const vp = page.getViewport({ scale: 1.0 });
+          setDocPageSizes(prev => (prev[i] ? prev : { ...prev, [i]: { width: vp.width, height: vp.height } }));
+          page.cleanup();
+          // Yield to main thread between pages to prevent any UI lag
+          await new Promise(r => setTimeout(r, 10));
+        }
+      } catch (err) {
+        console.error("Error loading PDF page sizes for mismatch checks:", err);
+      }
+    }).catch(() => {});
+
+    return () => {
+      active = false;
+      releasePdfDoc(bytes);
+    };
+  }, [doc?.pdfBytes, activeTab]);
 
   // Auto-switch to Properties when a shape is selected
   useEffect(() => {

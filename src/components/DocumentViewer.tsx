@@ -1783,7 +1783,8 @@ export const DocumentViewer = React.memo(function DocumentViewer({ tabId, isActi
           // Only the active viewer should write to shared root proxy fields.
           if (isActive) {
             setNumPages(pdf.numPages);
-            setPageNum(1);
+            const savedPage = useStore.getState().documents[tabId]?.pageNum || 1;
+            setPageNum(Math.min(Math.max(1, savedPage), pdf.numPages));
 
             // ── Pristine A-Master Sync ─────────────────────────────────────
             // If A-Master has no shapes and no background PDF, dynamically
